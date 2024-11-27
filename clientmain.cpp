@@ -12,10 +12,11 @@
 #include <stdint.h>
 #include <calcLib.h>
 #include "protocol.h"
+#include <netdb.h>
 
-// Function to send data over UDP
-int send_data(int socket_fd, struct sockaddr_in *server, socklen_t server_size, void *data, size_t data_size) {
-    int sent_length = sendto(socket_fd, data, data_size, 0, (struct sockaddr *)server, server_size);
+// Function to sending  data over UDP
+int send_data(int socket_fd, struct sockaddr *server, socklen_t server_size, void *data, size_t data_size) {
+    int sent_length = sendto(socket_fd, data, data_size, 0, server, server_size);
     if (sent_length < 0) {
         perror("sendto failed");
         exit(EXIT_FAILURE);
@@ -23,9 +24,9 @@ int send_data(int socket_fd, struct sockaddr_in *server, socklen_t server_size, 
     return sent_length;
 }
 
-// Function to receive data over UDP
-int receive_data(int socket_fd, struct sockaddr_in *server, socklen_t *server_size, void *buffer, size_t buffer_size) {
-    int received_length = recvfrom(socket_fd, buffer, buffer_size, 0, (struct sockaddr *)server, server_size);
+// Function to receiving data over UDP
+int receive_data(int socket_fd, struct sockaddr *server, socklen_t *server_size, void *buffer, size_t buffer_size) {
+    int received_length = recvfrom(socket_fd, buffer, buffer_size, 0, server, server_size);
     if (received_length < 0 && errno != EAGAIN) {
         perror("recvfrom failed");
         exit(EXIT_FAILURE);
@@ -35,62 +36,78 @@ int receive_data(int socket_fd, struct sockaddr_in *server, socklen_t *server_si
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <server_ip:port>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <hostname:port>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     int udp_socket;
     struct calcMessage request_msg;
-    struct sockaddr_in server_address;
     struct calcProtocol calc_request;
     struct calcMessage response_msg;
 
-    char *server_ip = strtok(argv[1], ":");
-    char *server_port_str = strtok(NULL, ":");
-    int server_port = atoi(server_port_str);
+    char *hostname = strtok(argv[1], ":");
+    char *port_str = strtok(NULL, ":");
+    int port = atoi(port_str);
 
-    printf("Connecting to server %s on port %d\n", server_ip, server_port);
+    printf("Resolving hostname: %s, port: %d\n", hostname, port);
 
-    udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udp_socket < 0) {
-        perror("Socket creation failed");
+    // Resolve hostname using getaddrinfo()
+    struct addrinfo hints, *server_info, *addr;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;      // Support both IPv4 and IPv6
+    hints.ai_socktype = SOCK_DGRAM;  // UDP
+
+    if (getaddrinfo(hostname, port_str, &hints, &server_info) != 0) {
+        perror("getaddrinfo failed");
         return EXIT_FAILURE;
     }
 
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin_family = AF_INET;
-    server_address.sin_port = htons(server_port);
-    server_address.sin_addr.s_addr = inet_addr(server_ip);
+    // Create socket using the first valid address from getaddrinfo()
+    addr = server_info;
+    while (addr != NULL) {
+        udp_socket = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (udp_socket >= 0) {
+            break;
+        }
+        addr = addr->ai_next;
+    }
 
-    // Initialize the request message
-    request_msg.type = htons(22);  // Client-to-server binary protocol
-    request_msg.message = htonl(0);  // NA
-    request_msg.protocol = htons(17);  // UDP
+    if (addr == NULL) {
+        fprintf(stderr, "Failed to create socket for any address.\n");
+        freeaddrinfo(server_info);
+        return EXIT_FAILURE;
+    }
+
+    // Let's start transmission part from here
+    request_msg.type = htons(22);  
+    request_msg.message = htonl(0);  
+    request_msg.protocol = htons(17);  
     request_msg.major_version = htons(1);
     request_msg.minor_version = htons(0);
 
     // Send the initial message to the server
-    send_data(udp_socket, &server_address, sizeof(server_address), &request_msg, sizeof(request_msg));
+    send_data(udp_socket, addr->ai_addr, addr->ai_addrlen, &request_msg, sizeof(request_msg));
 
     // Set timeout for receiving the server's response
     alarm(2);
 
-    socklen_t server_address_size = sizeof(server_address);
-    int recv_length = receive_data(udp_socket, &server_address, &server_address_size, &calc_request, sizeof(calc_request));
+    socklen_t server_addr_len = addr->ai_addrlen;
+    int recv_length = receive_data(udp_socket, addr->ai_addr, &server_addr_len, &calc_request, sizeof(calc_request));
 
     // Retry logic for timeout
     int retransmission_count = 0;
-    while (recv_length < 0 && errno == EAGAIN && retransmission_count < 2) {
+    while (recv_length < 0 && errno == EAGAIN && retransmission_count < 3) {
         printf("Timeout occurred. Retrying...\n");
-        send_data(udp_socket, &server_address, sizeof(server_address), &request_msg, sizeof(request_msg));
+        send_data(udp_socket, addr->ai_addr, addr->ai_addrlen, &request_msg, sizeof(request_msg));
         alarm(2);
-        recv_length = receive_data(udp_socket, &server_address, &server_address_size, &calc_request, sizeof(calc_request));
+        recv_length = receive_data(udp_socket, addr->ai_addr, &server_addr_len, &calc_request, sizeof(calc_request));
         retransmission_count++;
     }
-
+// checking whether the receiver part is ok or not
     if (recv_length < 0) {
         fprintf(stderr, "No response from server after retransmissions.\n");
         close(udp_socket);
+        freeaddrinfo(server_info);
         return EXIT_FAILURE;
     }
 
@@ -109,44 +126,46 @@ int main(int argc, char *argv[]) {
 
     // Perform the calculation
     switch (ntohl(calc_request.arith)) {
-        case 1:  // Add integers
+        case 1:  
             calc_request.inResult = htonl(ntohl(calc_request.inValue1) + ntohl(calc_request.inValue2));
             break;
-        case 2:  // Subtract integers
+        case 2:  
             calc_request.inResult = htonl(ntohl(calc_request.inValue1) - ntohl(calc_request.inValue2));
             break;
-        case 3:  // Multiply integers
+        case 3:  
             calc_request.inResult = htonl(ntohl(calc_request.inValue1) * ntohl(calc_request.inValue2));
             break;
-        case 4:  // Divide integers
+        case 4:  
             calc_request.inResult = htonl(ntohl(calc_request.inValue1) / ntohl(calc_request.inValue2));
             break;
-        case 5:  // Add floats
+        case 5:  
             calc_request.flResult = calc_request.flValue1 + calc_request.flValue2;
             break;
-        case 6:  // Subtract floats
+        case 6:  
             calc_request.flResult = calc_request.flValue1 - calc_request.flValue2;
             break;
-        case 7:  // Multiply floats
+        case 7:  
             calc_request.flResult = calc_request.flValue1 * calc_request.flValue2;
             break;
-        case 8:  // Divide floats
+        case 8:  
             calc_request.flResult = calc_request.flValue1 / calc_request.flValue2;
             break;
         default:
             fprintf(stderr, "Unknown operation requested.\n");
             close(udp_socket);
+            freeaddrinfo(server_info);
             return EXIT_FAILURE;
     }
 
     // Send the result back to the server
-    send_data(udp_socket, &server_address, sizeof(server_address), &calc_request, sizeof(calc_request));
+    send_data(udp_socket, addr->ai_addr, addr->ai_addrlen, &calc_request, sizeof(calc_request));
 
     // Receive the server's acknowledgment
-    recv_length = receive_data(udp_socket, &server_address, &server_address_size, &response_msg, sizeof(response_msg));
+    recv_length = receive_data(udp_socket, addr->ai_addr, &server_addr_len, &response_msg, sizeof(response_msg));
     if (recv_length < 0) {
         fprintf(stderr, "Failed to receive acknowledgment from server.\n");
         close(udp_socket);
+        freeaddrinfo(server_info);
         return EXIT_FAILURE;
     }
 
@@ -163,5 +182,6 @@ int main(int argc, char *argv[]) {
     }
 
     close(udp_socket);
+    freeaddrinfo(server_info);
     return EXIT_SUCCESS;
 }
